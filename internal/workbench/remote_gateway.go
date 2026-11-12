@@ -213,7 +213,12 @@ func (s *Server) clientRequest(w http.ResponseWriter, r *http.Request) {
 func (g *remoteGateway) hostInUse(id string) bool {
 	c := g.context()
 	inUse := func(state remotehost.ConnectionState) bool {
-		return state.HostID == id && (state.State == "connecting" || state.State == "connected")
+		switch state.State {
+		case "connecting", "connected", "reconnecting":
+			return state.HostID == id
+		default:
+			return false
+		}
 	}
 	return inUse(c.State) || (c.Candidate != nil && inUse(c.Candidate.Connection))
 }

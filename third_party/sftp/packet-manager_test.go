@@ -96,8 +96,8 @@ func TestPacketManager(t *testing.T) {
 		orderedPairs := make([]orderedPair, 0, len(table))
 		for _, p := range table {
 			orderedPairs = append(orderedPairs, orderedPair{
-				in:  orderedRequest{p.in, p.in.oid},
-				out: orderedResponse{p.out, p.out.oid},
+				in:  orderedRequest{requestPacket: p.in, orderid: p.in.oid},
+				out: orderedResponse{responsePacket: p.out, orderid: p.out.oid},
 			})
 		}
 		for _, p := range orderedPairs {

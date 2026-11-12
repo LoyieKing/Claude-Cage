@@ -44,7 +44,7 @@ func TestProjectShareCloseWaitsForTransportAndChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := &observedProjectReader{ReadCloser: output, entered: make(chan struct{})}
-	share := &projectShare{cmd: cmd, transport: projectTransport{reader, input}, done: make(chan struct{})}
+	share := &projectShare{cmd: cmd, transport: projectTransport{ReadCloser: reader, WriteCloser: input}, done: make(chan struct{})}
 	if err := cmd.Start(); err != nil {
 		_ = share.transport.Close()
 		t.Fatal(err)

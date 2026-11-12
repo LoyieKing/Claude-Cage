@@ -80,6 +80,23 @@ func (s rootedSys) close() error {
 	return windows.CloseHandle(s.rootHandle)
 }
 
+func (s rootedSys) sameFile(identity os.FileInfo) bool {
+	if identity == nil || s.rootHandle == 0 {
+		return false
+	}
+	var dup windows.Handle
+	if err := windows.DuplicateHandle(windows.CurrentProcess(), s.rootHandle, windows.CurrentProcess(), &dup, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+		return false
+	}
+	file := os.NewFile(uintptr(dup), s.localPath)
+	opened, err := file.Stat()
+	_ = file.Close()
+	if err != nil {
+		return false
+	}
+	return os.SameFile(identity, opened)
+}
+
 // slashPath returns the request path of the host path p.
 // sshfs sends the host path it was given, e.g. C:/Users/foo/bar,
 // which the sftp request server turns into /C:/Users/foo/bar.

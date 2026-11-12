@@ -162,3 +162,228 @@ func TestProcessEndpointClosesIdleProcess(t *testing.T) {
 		t.Fatal("idle helper was not reaped")
 	}
 }
+
+func TestFrameShortWritesPartialReadsAndConcurrentClose(t *testing.T) {
+	frame := bytes.Repeat([]byte{7}, 40)
+	var short oneByteWriter
+	if err := writeFrame(&short, frame); err != nil {
+		t.Fatal(err)
+	}
+	if short.writes < 2 || !bytes.Equal(short.buf.Bytes()[4:], frame) || binary.BigEndian.Uint32(short.buf.Bytes()[:4]) != uint32(len(frame)) {
+		t.Fatalf("short writes were not reassembled: writes=%d %x", short.writes, short.buf.Bytes())
+	}
+	var failing failAfterByte
+	if err := writeFrame(&failing, frame); err == nil {
+		t.Fatal("frame write succeeded after a short write error")
+	}
+	file, err := os.CreateTemp(t.TempDir(), "frame")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := writeFrame(file, frame); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := io.ReadAll(file)
+	if err != nil || !bytes.Equal(stored[4:], frame) {
+		t.Fatalf("vectored frame was not stored: %v %x", err, stored)
+	}
+	var reader oneByteReader
+	reader.rest = append([]byte(nil), stored...)
+	got, err := readFrame(&reader, make([]byte, maxFrameSize))
+	if err != nil || !bytes.Equal(got, frame) {
+		t.Fatalf("partial read: %v %x", err, got)
+	}
+
+	left, right := net.Pipe()
+	defer right.Close()
+	conn := newBoundedFrameConnection(left)
+	good := bytes.Repeat([]byte{0}, 32)
+	copy(good[6:12], guestSourceMAC)
+	go func() {
+		_ = writeFrame(right, good)
+		_ = writeFrame(right, good)
+	}()
+	collect := func() []byte {
+		t.Helper()
+		var assembled []byte
+		buf := make([]byte, 1)
+		for len(assembled) < 4+len(good) {
+			n, err := conn.Read(buf)
+			assembled = append(assembled, buf[:n]...)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return assembled
+	}
+	first, second := collect(), collect()
+	if !bytes.Equal(first[4:], good) || !bytes.Equal(second[4:], good) {
+		t.Fatal("reused frame buffer corrupted a later frame")
+	}
+	bad := bytes.Repeat([]byte{1}, 32)
+	go func() { _ = writeFrame(right, bad) }()
+	if _, err := conn.Read(make([]byte, 16)); err == nil {
+		t.Fatal("unexpected Ethernet source was accepted")
+	}
+
+	blocked, other := net.Pipe()
+	defer other.Close()
+	waiting := newBoundedFrameConnection(blocked)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := waiting.Read(make([]byte, 8))
+		readDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := waiting.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("close did not unblock a frame read")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frame close blocked")
+	}
+}
+
+func TestProcessEndpointCloseUnblocksRead(t *testing.T) {
+	if os.Getenv("CAGE_CONTAINER_PIPE_TEST") == "close" {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestProcessEndpointCloseUnblocksRead$")
+	command.Env = append(os.Environ(), "CAGE_CONTAINER_PIPE_TEST=close")
+	endpoint, wait, err := ProcessEndpoint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := endpoint.Read(make([]byte, 8))
+		readDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := endpoint.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("close did not unblock the process pipe")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("process close blocked")
+	}
+	waited := make(chan struct{})
+	go func() { _ = wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("closed helper was not reaped")
+	}
+}
+
+func TestRestartedNetworkGateIsClosedWithoutLease(t *testing.T) {
+	first, err := NewNetwork(cage.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewNetwork(cage.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Gate.Close("test")
+	defer second.Gate.Close("test")
+	before, after := first.Gate.Status(), second.Gate.Status()
+	if before.RunID == "" || before.RunID == after.RunID || before.Mode != cage.GateClosed || after.Mode != cage.GateClosed || before.Report != nil || after.Report != nil || !before.Until.IsZero() || !after.Until.IsZero() {
+		t.Fatalf("restart reused a gate lease: %+v %+v", before, after)
+	}
+}
+
+func TestBlockedFrameWriteReleasedByCloseAndDeadline(t *testing.T) {
+	for _, name := range []string{"close", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			defer writer.Close()
+			if err := writer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			frame := bytes.Repeat([]byte{9}, 1024)
+			for {
+				err = writeFrame(writer, frame)
+				if err != nil {
+					break
+				}
+			}
+			if err := writer.SetWriteDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- writeFrame(writer, frame) }()
+			time.Sleep(50 * time.Millisecond)
+			if name == "close" {
+				_ = writer.Close()
+			} else if err := writer.SetWriteDeadline(time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("blocked frame write succeeded after release")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("blocked frame write was not released")
+			}
+		})
+	}
+}
+
+type oneByteWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (w *oneByteWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	w.writes++
+	return w.buf.Write(data[:1])
+}
+
+type failAfterByte struct{ wrote bool }
+
+func (w *failAfterByte) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if w.wrote {
+		return 0, io.ErrClosedPipe
+	}
+	w.wrote = true
+	return 1, nil
+}
+
+type oneByteReader struct{ rest []byte }
+
+func (r *oneByteReader) Read(data []byte) (int, error) {
+	if len(r.rest) == 0 {
+		return 0, io.EOF
+	}
+	if len(data) == 0 {
+		return 0, nil
+	}
+	data[0] = r.rest[0]
+	r.rest = r.rest[1:]
+	return 1, nil
+}

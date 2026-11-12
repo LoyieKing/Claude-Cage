@@ -297,16 +297,35 @@ func sendPacket(w io.Writer, m encoding.BinaryMarshaler) error {
 
 	binary.BigEndian.PutUint32(header[:4], uint32(length))
 
-	if _, err := w.Write(header); err != nil {
+	if err := writeFull(w, header); err != nil {
 		return fmt.Errorf("failed to send packet: %w", err)
 	}
 
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
+		if err := writeFull(w, payload); err != nil {
 			return fmt.Errorf("failed to send packet payload: %w", err)
 		}
 	}
 
+	return nil
+}
+
+// writeFull finishes a short write. A writer that returns (0, nil) is broken;
+// retrying it would livelock the session.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return fmt.Errorf("invalid write count %d", n)
+		}
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
 	return nil
 }
 

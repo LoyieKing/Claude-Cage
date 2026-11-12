@@ -5,6 +5,7 @@ package reversesshfs
 import (
 	"errors"
 	"io"
+	"os"
 
 	"github.com/pkg/sftp"
 )
@@ -16,5 +17,7 @@ func newRootedServer(io.ReadWriteCloser, string, bool, []string) (*sftp.RequestS
 }
 
 func (*rootedHandlers) Close() error { return nil }
+
+func (*rootedHandlers) sameOpenedRoot(os.FileInfo) bool { return false }
 
 func (*rootedHandlers) expectRemove(string) bool { return false }

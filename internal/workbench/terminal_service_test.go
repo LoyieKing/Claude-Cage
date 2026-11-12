@@ -73,7 +73,10 @@ func readTerminalUntil(t *testing.T, sub *terminalSubscription, needle string) s
 			if !ok {
 				t.Fatalf("terminal ended before %q: %q", needle, text)
 			}
-			text += string(chunk)
+			if chunk.InputStatus != "" {
+				continue
+			}
+			text += string(chunk.Data)
 		case <-deadline:
 			t.Fatalf("terminal did not produce %q: %q", needle, text)
 		}

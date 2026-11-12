@@ -33,11 +33,12 @@ type terminalRequest struct {
 // manager serializes process creation with closure so no process can be
 // published after shutdown has collected the sessions it needs to close.
 type terminalManager struct {
-	mu       sync.Mutex
-	sessions map[string]*terminalSession
-	sequence int
-	closed   bool
-	workers  sync.WaitGroup
+	mu        sync.Mutex
+	sessions  map[string]*terminalSession
+	sequence  int
+	closed    bool
+	workers   sync.WaitGroup
+	stopGuest func(context.Context) error
 }
 
 func (m *terminalManager) startSession(cmd *exec.Cmd, workspace, kind string, selection claudeSelection, finished func()) (*terminalSession, error) {
@@ -80,7 +81,7 @@ func (m *terminalManager) startSessionWithPTY(cmd *exec.Cmd, workspace, kind str
 	go func() {
 		defer m.workers.Done()
 		session.run()
-		if finished != nil {
+		if finished != nil && !session.skipFinished() {
 			finished()
 		}
 	}()
@@ -204,6 +205,76 @@ func (m *terminalManager) closeAll() {
 	for _, session := range sessions {
 		session.close()
 	}
+	m.mu.Lock()
+	stop := m.stopGuest
+	m.mu.Unlock()
+	if stop != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		_ = stop(ctx)
+		cancel()
+	}
+}
+
+// beginDetach seals admission and marks persistent guest PTYs detach-only.
+// It performs no waits and no network I/O. Call it before cancelling SSH.
+func (m *terminalManager) beginDetach() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	for _, session := range m.sessions {
+		session.beginDetach()
+	}
+}
+
+// detach reuses the detach-only mark, then closes attachments. Native PTYs are
+// reaped. Guest shells stay running until explicit closeAll.
+func (m *terminalManager) detach() {
+	m.beginDetach()
+	m.mu.Lock()
+	sessions := make([]*terminalSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		sessions = append(sessions, session)
+	}
+	m.mu.Unlock()
+	for _, session := range sessions {
+		if session.persistsInGuest() {
+			session.signalDetach()
+			continue
+		}
+		session.close()
+	}
+}
+
+func (m *terminalManager) adopt(session *terminalSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || session == nil || session.id == "" {
+		return
+	}
+	if m.sessions == nil {
+		m.sessions = map[string]*terminalSession{}
+	}
+	if m.sessions[session.id] != nil {
+		return
+	}
+	m.sessions[session.id] = session
+}
+
+func (m *terminalManager) rekey(oldID, newID string) {
+	if oldID == "" || newID == "" || oldID == newID {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[oldID]
+	if session == nil || m.sessions[newID] != nil {
+		return
+	}
+	delete(m.sessions, oldID)
+	session.mu.Lock()
+	session.id = newID
+	session.mu.Unlock()
+	m.sessions[newID] = session
 }
 
 func (m *terminalManager) close() {
@@ -373,7 +444,15 @@ func (s *Server) createTerminalLocked(input terminalRequest) (*terminalSession, 
 			return nil, errMobileLocked
 		}
 	}
-	session, err := s.terminals.startSession(cmd, workspace, input.Kind, selection, finished)
+	var session *terminalSession
+	if s.macosGuest == nil {
+		session, err = s.startPersistentGuestShell(guestShellSpec{
+			Script: script, Workspace: workspace, Kind: input.Kind, Selection: selection, Finished: finished,
+			Login: input.Kind == "claude-login",
+		})
+	} else {
+		session, err = s.terminals.startSession(cmd, workspace, input.Kind, selection, finished)
+	}
 	if input.requestContext != nil {
 		s.account.mu.Unlock()
 	}
@@ -382,6 +461,9 @@ func (s *Server) createTerminalLocked(input terminalRequest) (*terminalSession, 
 		session.sharedID = conversation.ID
 		session.connectionID = conversation.Connection
 		session.mu.Unlock()
+		if session.persistsInGuest() {
+			s.noteGuestShellConversation(session.id, conversation.ID, conversation.Connection)
+		}
 		s.mobileCLI.mu.Lock()
 		conversation.TerminalID = session.id
 		if saveErr := writePrivate(mobileRecordPath(s.profile, conversation.ID), conversation); saveErr != nil {

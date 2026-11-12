@@ -86,6 +86,11 @@ func (s *Server) startMonitors() {
 func (s *Server) beginClose() {
 	s.mu.Lock()
 	s.closing = true
+	s.mu.Unlock()
+	// Mark persistent attachments before cancelling their SSH transports.
+	// Otherwise EOF teardown could mistake controller shutdown for user Stop.
+	s.terminals.beginDetach()
+	s.mu.Lock()
 	s.lifetimeContextLocked()
 	s.lifeCancel()
 	if s.checkCancel != nil {
@@ -125,10 +130,13 @@ func (s *Server) beginActivity(parent context.Context) (context.Context, func(),
 // disk. It runs outside request handlers and without either workbench lock.
 func (s *Server) closeService() error {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		s.mu.Unlock()
+		// Close host attachments first to release handlers. Persistent guest
+		// shells survive controller shutdown; explicit environment Stop kills them.
+		s.terminals.detach()
 		s.beginClose()
-		// Closing PTYs first releases handlers blocked writing terminal input.
-		// The manager also rejects a terminal created by an already-admitted call.
-		s.terminals.close()
 		s.closeBackground()
 		s.activities.Wait()
 		s.op.Lock()

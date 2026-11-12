@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 
 	"github.com/lima-vm/sshocker/pkg/ssh"
-	"github.com/lima-vm/sshocker/pkg/util"
 	"github.com/sirupsen/logrus"
 )
 
@@ -39,6 +38,8 @@ type ReverseSSHFS struct {
 	Readonly                bool
 	sshCmd                  *exec.Cmd
 	opensshSftpServerCmd    *exec.Cmd
+	builtinTransport        io.ReadWriteCloser
+	builtinDone             chan struct{}
 	SSHFSAdditionalArgs     []string
 
 	// ReadonlyNames makes a path read-only when any of its components is one of these names
@@ -194,26 +195,26 @@ func (rsf *ReverseSSHFS) Start() error {
 		return fmt.Errorf("ReadonlyNames requires driver %q, got %q", DriverBuiltin, driver)
 	}
 	var (
-		builtinSftpServer interface{ Serve() error }
-		rooted            *rootedHandlers
+		builtinSftpServer interface {
+			Serve() error
+			Close() error
+		}
+		rooted       *rootedHandlers
+		releaseChild func()
 	)
 	switch driver {
 	case DriverBuiltin:
-		stdinPipe, err := rsf.sshCmd.StdinPipe()
+		stdio, release, err := prepareBuiltinTransport(rsf.sshCmd)
 		if err != nil {
 			return err
 		}
-		stdoutPipe, err := rsf.sshCmd.StdoutPipe()
-		if err != nil {
-			return err
-		}
-		stdio := &util.RWC{
-			ReadCloser:  stdoutPipe,
-			WriteCloser: stdinPipe,
-		}
+		releaseChild = release
+		rsf.builtinTransport = stdio
 		builtinSftpServer, rooted, err = newRootedServer(stdio, rsf.LocalPath, rsf.Readonly, rsf.ReadonlyNames)
 		rsf.rooted.Store(rooted)
 		if err != nil {
+			releaseChild()
+			_ = stdio.Close()
 			return err
 		}
 	case DriverOpensshSftpServer:
@@ -249,16 +250,30 @@ func (rsf *ReverseSSHFS) Start() error {
 		}
 	}
 	logrus.Debugf("executing ssh for remote sshfs: %s %v", rsf.sshCmd.Path, rsf.sshCmd.Args)
-	if err := rsf.sshCmd.Start(); err != nil {
+	startErr := rsf.sshCmd.Start()
+	if releaseChild != nil {
+		releaseChild()
+	}
+	if startErr != nil {
+		if rsf.builtinTransport != nil {
+			_ = rsf.builtinTransport.Close()
+		}
+		if builtinSftpServer != nil {
+			_ = builtinSftpServer.Close()
+		}
 		if rooted != nil {
 			rooted.Close()
 		}
-		return err
+		return startErr
 	}
 	logrus.Debugf("starting sftp server for %v", rsf.LocalPath)
 	switch driver {
 	case DriverBuiltin:
+		rsf.builtinDone = make(chan struct{})
+		done, transport := rsf.builtinDone, rsf.builtinTransport
 		go func() {
+			defer close(done)
+			defer transport.Close()
 			if rooted != nil {
 				defer rooted.Close()
 			}
@@ -345,6 +360,11 @@ func (rsf *ReverseSSHFS) Close() error {
 	if rsf.sshCmd != nil {
 		logrus.Debugf("killing processes for remote sshfs: %s %v", rsf.sshCmd.Path, rsf.sshCmd.Args)
 	}
+	// Closing the socket interrupts both directions before process teardown.
+	// Waiting for a sender mutex here would recreate the full-duplex deadlock.
+	if rsf.builtinTransport != nil {
+		_ = rsf.builtinTransport.Close()
+	}
 	var errors []error
 	for _, cmd := range []*exec.Cmd{rsf.sshCmd, rsf.opensshSftpServerCmd} {
 		if cmd == nil || cmd.Process == nil {
@@ -355,6 +375,9 @@ func (rsf *ReverseSSHFS) Close() error {
 		}
 		// Reap it, and close its pipes. The error is the kill itself, or a second Close.
 		_ = cmd.Wait()
+	}
+	if rsf.builtinDone != nil {
+		<-rsf.builtinDone
 	}
 	if len(errors) > 0 {
 		return fmt.Errorf("%v", errors)

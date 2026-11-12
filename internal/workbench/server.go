@@ -105,6 +105,8 @@ type Server struct {
 	mobileConnectMu                                  sync.Mutex
 	audioClients                                     int
 	projectShares                                    map[string]*projectShare
+	projectShareEpoch                                map[string]uint64
+	projectRecordsMu                                 sync.Mutex
 	projectErrors                                    []projectShareError
 	clientMounts                                     map[string]*guestClientMount
 	clientWorkspace                                  string
@@ -665,8 +667,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"workspace": s.workspaceLocked(), "environment_workspace": s.workspaceLocked() == s.environmentDir(), "environment_directory": s.environmentDir(),
 		"environment_identity_directory": cage.EnvironmentIdentityDir(s.profile),
 		"local_vm_storage":               s.localVMStorage(), "project_error": projectError, "project_errors": s.projectErrors,
-		"storage_recovery": s.storageRecoveryStatusLocked(),
-		"keyboard":         s.preferences.Keyboard, "auto_timezone": s.preferences.AutoTimezone, "job": s.jobs.snapshot(),
+		"project_share_states": s.projectShareStatesLocked(),
+		"storage_recovery":     s.storageRecoveryStatusLocked(),
+		"keyboard":             s.preferences.Keyboard, "auto_timezone": s.preferences.AutoTimezone, "job": s.jobs.snapshot(),
 		"location": s.location, "network_error": s.currentNetworkErrorLocked(), "can_restore": e == nil,
 		"safety": s.safety, "environment_update_required": s.guestUpdateRequired, "environment_update_error": s.guestUpdateError,
 	}

@@ -20,4 +20,8 @@
 | 导出故障日志并了解自动清理 | [导出诊断包](troubleshooting.md#导出诊断包) |
 | 报告隔离或凭据安全问题 | [安全报告](../SECURITY.md) |
 
+## 实现与恢复契约
+
+[网络、共享与终端恢复重构](network-recovery-refactor.md)记录传输背压、组件故障隔离、持久终端、自动重连的接口、安全边界和验收条件。[未发行源码说明](releases/unreleased-network-recovery.md)列出实现、实际检查和恢复限制，不替代发行版能力说明。
+
 许可材料见 [LICENSE](../LICENSE)、[NOTICE](../NOTICE)和[第三方许可](../THIRD_PARTY_LICENSES)。

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -69,7 +70,7 @@ func (n *Network) Run(ctx context.Context, endpoint net.Conn) error {
 	defer stop()
 	defer n.Gate.Close("容器网络连接已断开")
 	defer endpoint.Close()
-	return n.stack.AcceptQemu(ctx, &boundedFrameConnection{Conn: endpoint})
+	return n.stack.AcceptQemu(ctx, newBoundedFrameConnection(endpoint))
 }
 
 // ServeSSH only accepts the listener supplied by the host. It never listens
@@ -135,27 +136,88 @@ func ProcessEndpoint(command *exec.Cmd) (net.Conn, func() error, error) {
 		output.Close()
 		return nil, nil, err
 	}
-	endpoint, bridge := net.Pipe()
-	var closeOnce sync.Once
-	closeProcess := func() {
-		closeOnce.Do(func() { _ = input.Close(); _ = output.Close(); _ = bridge.Close(); _ = command.Process.Kill() })
+	stdin, stdinOK := input.(*os.File)
+	stdout, stdoutOK := output.(*os.File)
+	if !stdinOK || !stdoutOK {
+		_ = input.Close()
+		_ = output.Close()
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return nil, nil, errors.New("容器网络管道不支持截止时间")
 	}
-	var copies sync.WaitGroup
-	copies.Add(2)
-	go func() { defer copies.Done(); defer closeProcess(); _, _ = io.Copy(input, bridge) }()
-	go func() { defer copies.Done(); defer closeProcess(); _, _ = io.Copy(bridge, output) }()
+	var killOnce sync.Once
+	kill := func() {
+		killOnce.Do(func() {
+			if command.Process != nil {
+				_ = command.Process.Kill()
+			}
+		})
+	}
+	endpoint := &processConnection{stdin: stdin, stdout: stdout, kill: kill}
 	var waitOnce sync.Once
 	var waitErr error
 	wait := func() error {
-		waitOnce.Do(func() { _ = endpoint.Close(); closeProcess(); copies.Wait(); waitErr = command.Wait() })
+		waitOnce.Do(func() { _ = endpoint.Close(); waitErr = command.Wait() })
 		return waitErr
 	}
-	return &processConnection{Conn: endpoint, closeProcess: closeProcess}, wait, nil
+	return endpoint, wait, nil
 }
 
 type processConnection struct {
-	net.Conn
-	closeProcess func()
+	stdin  *os.File
+	stdout *os.File
+	once   sync.Once
+	kill   func()
+	err    error
 }
 
-func (c *processConnection) Close() error { err := c.Conn.Close(); c.closeProcess(); return err }
+func (c *processConnection) Read(data []byte) (int, error) { return c.stdout.Read(data) }
+
+func (c *processConnection) Write(data []byte) (int, error) {
+	written := 0
+	for len(data) > 0 {
+		n, err := c.stdin.Write(data)
+		if n < 0 || n > len(data) {
+			return written, io.ErrShortWrite
+		}
+		written += n
+		data = data[n:]
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func (c *processConnection) Close() error {
+	c.once.Do(func() {
+		c.err = errors.Join(c.stdout.Close(), c.stdin.Close())
+		if c.kill != nil {
+			c.kill()
+		}
+	})
+	return c.err
+}
+
+func (c *processConnection) LocalAddr() net.Addr  { return processAddr("local") }
+func (c *processConnection) RemoteAddr() net.Addr { return processAddr("remote") }
+
+func (c *processConnection) SetDeadline(deadline time.Time) error {
+	return errors.Join(c.SetReadDeadline(deadline), c.SetWriteDeadline(deadline))
+}
+
+func (c *processConnection) SetReadDeadline(deadline time.Time) error {
+	return c.stdout.SetReadDeadline(deadline)
+}
+
+func (c *processConnection) SetWriteDeadline(deadline time.Time) error {
+	return c.stdin.SetWriteDeadline(deadline)
+}
+
+type processAddr string
+
+func (processAddr) Network() string  { return "pipe" }
+func (a processAddr) String() string { return string(a) }

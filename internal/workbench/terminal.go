@@ -68,6 +68,18 @@ func (s *Server) terminalStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if subscription.Lost {
+		_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := ws.WriteJSON(map[string]any{"type": "lost"}); err != nil {
+			return
+		}
+	}
+	if subscription.InitialGap != nil {
+		_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := ws.WriteJSON(map[string]any{"type": "gap", "from": subscription.InitialGap.From, "to": subscription.InitialGap.To, "omitted": subscription.InitialGap.Omitted}); err != nil {
+			return
+		}
+	}
 	if len(subscription.History) > 0 {
 		_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		// Replayed output must render without repeating clipboard side effects.
@@ -99,7 +111,26 @@ func (s *Server) terminalStream(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if ws.WriteMessage(websocket.BinaryMessage, chunk) != nil {
+				if chunk.InputStatus != "" {
+					if ws.WriteJSON(map[string]any{"type": "input-status", "id": chunk.InputID, "status": chunk.InputStatus}) != nil {
+						return
+					}
+					continue
+				}
+				if chunk.Replay {
+					if ws.WriteJSON(map[string]string{"type": "history"}) != nil {
+						return
+					}
+				}
+				if len(chunk.Data) > 0 && ws.WriteMessage(websocket.BinaryMessage, chunk.Data) != nil {
+					return
+				}
+			case gap, ok := <-subscription.Gaps:
+				if !ok {
+					return
+				}
+				_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if ws.WriteJSON(map[string]any{"type": "gap", "from": gap.From, "to": gap.To, "omitted": gap.Omitted}) != nil {
 					return
 				}
 			}
@@ -117,6 +148,7 @@ func (s *Server) terminalStream(w http.ResponseWriter, r *http.Request) {
 		}
 		var input struct {
 			Type string `json:"type"`
+			ID   string `json:"id"`
 			Data string `json:"data"`
 			Cols uint16 `json:"cols"`
 			Rows uint16 `json:"rows"`
@@ -126,7 +158,7 @@ func (s *Server) terminalStream(w http.ResponseWriter, r *http.Request) {
 		}
 		switch input.Type {
 		case "input":
-			if err := session.enqueueInput(r.Context(), input.Data); err != nil {
+			if err := session.enqueueInputID(r.Context(), input.ID, input.Data); err != nil {
 				return
 			}
 		case "resize":

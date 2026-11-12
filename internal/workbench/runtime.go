@@ -213,6 +213,9 @@ func (s *Server) attach() error {
 	s.ready = true
 	s.mu.Unlock()
 	s.restoreProjectShares()
+	if err := s.restoreGuestTerminals(ctx); err != nil {
+		_ = diagnostics.New(s.profile).Record("warn", "terminal-recovery", "guest terminal reconciliation failed: "+err.Error())
+	}
 	s.desktopViews.background(s.changeDesktopVisibility)
 	s.browserViews.background(s.changeBrowserVisibility)
 	return nil
@@ -226,26 +229,36 @@ func (s *Server) monitor(ctx context.Context) {
 		if s.op.TryLock() {
 			skipped = 0
 			if !s.busy() {
-				s.mu.Lock()
-				ready := s.ready
-				token := s.credentials.Token
-				s.mu.Unlock()
-				if !ready || s.macosGuest != nil || s.windowsGuest != nil {
-					_ = s.attach()
+				if err := s.monitorContainerRuntime(ctx); err != nil {
+					s.mu.Lock()
+					s.ready = false
+					s.mu.Unlock()
+					timing.result = "runtime_recovery_pending"
 				} else {
-					ctx, cancel := s.controlContext()
-					_, err := s.guestAPI(ctx, token, "GET", "/health", nil)
-					cancel()
-					if err != nil {
-						s.mu.Lock()
-						s.ready = false
-						s.mu.Unlock()
+					s.mu.Lock()
+					ready := s.ready
+					token := s.credentials.Token
+					s.mu.Unlock()
+					if ready {
+						s.recoverProjectShares(ctx)
 					}
-				}
-				timing.stage("environment_health")
-				if s.macosGuest != nil {
-					s.monitorNetworkTick()
-					timing.stage("network_tick")
+					if !ready || s.macosGuest != nil || s.windowsGuest != nil {
+						_ = s.attach()
+					} else {
+						ctx, cancel := s.controlContext()
+						_, err := s.guestAPI(ctx, token, "GET", "/health", nil)
+						cancel()
+						if err != nil {
+							s.mu.Lock()
+							s.ready = false
+							s.mu.Unlock()
+						}
+					}
+					timing.stage("environment_health")
+					if s.macosGuest != nil {
+						s.monitorNetworkTick()
+						timing.stage("network_tick")
+					}
 				}
 			} else {
 				timing.result = "job_running"

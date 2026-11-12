@@ -86,9 +86,7 @@ func (s *Server) prepareCLIConnection(terminal *terminalSession, id string) {
 				}
 				nextCheck = time.Now().Add(time.Second)
 			}
-			terminal.mu.Lock()
-			text := cliStartupText(terminal.history)
-			terminal.mu.Unlock()
+			text := terminal.automationText()
 			dialog := cliStartupDialog(text, record.GuestWorkspace)
 			if dialog == "" || completed[dialog] {
 				continue

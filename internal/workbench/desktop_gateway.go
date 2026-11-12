@@ -80,6 +80,8 @@ func (t *desktopTarget) state() remotehost.ConnectionState {
 
 func (t *desktopTarget) acquire() (*remotehost.Session, error) {
 	if t.remote != nil {
+		// t.id is the manager's live ConnectionID. Callers that read it for an
+		// active remote target hold desktopGateway.mu, which also covers rotation.
 		return t.remote.Acquire(t.id)
 	}
 	t.mu.Lock()
@@ -137,9 +139,10 @@ func newDesktopGateway(profile string, local DesktopLocalController) *remoteGate
 }
 
 func (d *desktopGateway) context() ClientContext {
-	d.mu.RLock()
+	d.mu.Lock()
+	d.rotateRemoteLocked()
 	generation, active, pending := d.generation, d.active, d.pending
-	d.mu.RUnlock()
+	d.mu.Unlock()
 	c := ClientContext{DesktopGateway: true, Mode: "none", ConnectionID: generation, ClientPlatform: runtime.GOOS, State: remotehost.ConnectionState{State: "disconnected"}, Candidate: pending.candidate()}
 	if active == nil {
 		return c
@@ -195,6 +198,7 @@ func (d *desktopGateway) prepare(in switchRequest) (*desktopCandidate, error) {
 	switch in.Mode {
 	case "remote":
 		t.remote = remotehost.NewManager(d.store)
+		t.remote.SetRecovery(false)
 		secret := []byte(in.Passphrase)
 		st, err := t.remote.Connect(in.HostID, remotehost.ConnectSecrets{Passphrase: secret, Deploy: in.Deploy})
 		clear(secret)
@@ -382,10 +386,19 @@ func (d *desktopGateway) commit(ctx context.Context, in switchRequest) error {
 			return err
 		}
 	}
-	if _, err = t.acquire(); err != nil {
+	if t.remote != nil {
+		if err = t.remote.Publish(); err != nil {
+			return errors.New("候选工作台连接已中断，请重新连接")
+		}
+	} else if _, err = t.acquire(); err != nil {
 		return errors.New("候选工作台连接已中断，请重新连接")
 	}
 	d.mu.Lock()
+	if t.remote != nil {
+		if state := t.remote.Snapshot(); state.State == "connected" && state.ConnectionID != "" {
+			t.id = state.ConnectionID
+		}
+	}
 	d.generation, d.active, d.pending = t.id, t, nil
 	d.mu.Unlock()
 	old.close()
@@ -435,8 +448,9 @@ func (d *desktopGateway) clearSelection() {
 }
 
 func (d *desktopGateway) acquire(id string) (*remotehost.Session, bool, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rotateRemoteLocked()
 	if d.closed || d.active == nil {
 		return nil, false, errViewChanged
 	}
@@ -445,6 +459,20 @@ func (d *desktopGateway) acquire(id string) (*remotehost.Session, bool, error) {
 	}
 	session, err := d.active.acquire()
 	return session, d.active.mode == "remote", err
+}
+
+// rotateRemoteLocked pins the desktop view to the manager's published
+// ConnectionID. A retired id stops matching immediately, before any UI poll.
+func (d *desktopGateway) rotateRemoteLocked() {
+	if d.closed || d.departing || d.active == nil || d.active.remote == nil {
+		return
+	}
+	state := d.active.remote.Snapshot()
+	if state.State != "connected" || state.ConnectionID == "" || state.ConnectionID == d.active.id {
+		return
+	}
+	d.active.id = state.ConnectionID
+	d.generation = state.ConnectionID
 }
 
 func (d *desktopGateway) close() {

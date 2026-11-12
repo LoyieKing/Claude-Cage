@@ -100,13 +100,10 @@ func (s *Server) removeProject(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	var saved sharedProjects
-	filename := filepath.Join(s.profile, "projects.json")
-	data, err := os.ReadFile(filename)
-	if err == nil {
-		err = json.Unmarshal(data, &saved)
-	}
+	s.projectRecordsMu.Lock()
+	saved, err := s.loadProjectRecordsLocked()
 	if err != nil && !os.IsNotExist(err) {
+		s.projectRecordsMu.Unlock()
 		requestError(w, err)
 		return
 	}
@@ -115,13 +112,15 @@ func (s *Server) removeProject(w http.ResponseWriter, r *http.Request) {
 		// later write fails, a retry can still find and remove this project.
 		if !slices.Contains(saved.Paths, path) {
 			saved.Paths = append(saved.Paths, path)
-			if err = writePrivate(filename, saved); err != nil {
+			if err = s.writeProjectRecordsLocked(saved); err != nil {
+				s.projectRecordsMu.Unlock()
 				requestError(w, err)
 				return
 			}
 		}
 		preferences.Workspace = s.environmentDir()
 		if err = writePrivate(filepath.Join(s.profile, "workbench.json"), preferences); err != nil {
+			s.projectRecordsMu.Unlock()
 			requestError(w, err)
 			return
 		}
@@ -131,15 +130,19 @@ func (s *Server) removeProject(w http.ResponseWriter, r *http.Request) {
 	}
 	deleteProject := func(value string) bool { return value == path }
 	saved.Paths = slices.DeleteFunc(saved.Paths, deleteProject)
-	if err = writePrivate(filename, saved); err != nil {
+	if err = s.writeProjectRecordsLocked(saved); err != nil {
+		s.projectRecordsMu.Unlock()
 		requestError(w, err)
 		return
 	}
 	s.mu.Lock()
-	share := s.projectShares[path]
-	delete(s.projectShares, path)
+	share := s.sealProjectShareLocked(path, projectShareRevoked)
 	s.mu.Unlock()
+	s.projectRecordsMu.Unlock()
 	if share != nil {
+		if share.cancel != nil {
+			share.cancel()
+		}
 		share.close()
 	}
 	s.setProjectError(path, nil)

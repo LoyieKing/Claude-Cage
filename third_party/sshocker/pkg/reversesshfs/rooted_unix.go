@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/sys/unix"
@@ -42,6 +43,24 @@ func openRootedSys(localPath string) (rootedSys, error) {
 
 func (s rootedSys) close() error {
 	return unix.Close(s.rootFD)
+}
+
+func (s rootedSys) sameFile(identity os.FileInfo) bool {
+	if identity == nil {
+		return false
+	}
+	var st unix.Stat_t
+	if unix.Fstat(s.rootFD, &st) != nil {
+		return false
+	}
+	switch sys := identity.Sys().(type) {
+	case *syscall.Stat_t:
+		return uint64(sys.Dev) == uint64(st.Dev) && uint64(sys.Ino) == uint64(st.Ino)
+	case *unix.Stat_t:
+		return sys.Dev == st.Dev && sys.Ino == st.Ino
+	default:
+		return false
+	}
 }
 
 // slashPath returns the request path of the host path p.

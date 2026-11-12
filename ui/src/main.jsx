@@ -16,7 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { api, normalizeURL, native, nativeAvailable } from "./api";
-import { clientKeyboard, clientStorageKey, getClientContext, isRemoteClient, runtimeURL, runtimeSocketURL } from "./client-context.mjs";
+import { clientKeyboard, clientStorageKey, getClientContext, isRemoteClient, runtimeURL, runtimeSocketURL, transportGeneration } from "./client-context.mjs";
 import { shareClipboard } from "./shared-clipboard.mjs";
 import { RemoteView, TerminalView, Modal } from "./views";
 import { usePasswordVault } from "./password-vault";
@@ -287,9 +287,10 @@ function App() {
           ? status?.environment_update_required ? "环境待更新" : "浏览器待恢复"
           : "已停止";
   const notify = (text) => setToast(text);
-  const clipboardConnection = getClientContext().connection_id;
+  const clientNow = getClientContext();
+  const readonlyStreamKey = `${transportGeneration(clientNow)}:${clientNow.connection?.state || ""}:${clientNow.connection_id || ""}`;
   useEffect(() => {
-    if (!status?.ready || !nativeAvailable()) return;
+    if (!status?.ready || !nativeAvailable() || getClientContext().connection?.state === "reconnecting") return;
     const clipboard = shareClipboard({
       connect: () => new WebSocket(runtimeSocketURL("/clipboard")), native,
       onStatus: setToast,
@@ -297,7 +298,7 @@ function App() {
     });
     window.cageSyncClipboard = () => clipboard.sync();
     return () => { clipboard.dispose(); delete window.cageSyncClipboard; };
-  }, [status?.ready, clipboardConnection]);
+  }, [status?.ready, readonlyStreamKey]);
   const desktopFiles = useDesktopFiles(Boolean(status?.ready), notify);
   const downloads = [...(browser.downloads || []), ...desktopFiles.downloads];
   useDownloadNotifications(downloads, notify, Boolean(browser.uploads?.length || desktopFiles.uploads.length));
@@ -782,7 +783,7 @@ function App() {
     return () => { live = false; };
   }, [settings, status, fatal, connectionError]);
   useEffect(() => {
-    if (!status?.ready) return;
+    if (!status?.ready || getClientContext().connection?.state === "reconnecting") return;
     const stream = new EventSource(runtimeURL("/browser/events"));
     stream.addEventListener("clipboard", (event) => {
       remote.current?.receiveCopy(JSON.parse(event.data));
@@ -832,7 +833,7 @@ function App() {
       browserStreamReady.current = false;
       stream.close();
     };
-  }, [status?.ready]);
+  }, [status?.ready, readonlyStreamKey]);
   useEffect(() => {
     if (current && current.kind !== "terminal")
       lastBrowserTab.current = current.id;

@@ -143,6 +143,11 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
+	// Persist Stop before touching the container so a late Recover cannot
+	// observe the old running intent and launch another worker.
+	if _, err := r.advanceIntent(intentStopped, ""); err != nil {
+		return err
+	}
 	rootless, _, err := r.engineSecurity(ctx)
 	if err != nil {
 		return err

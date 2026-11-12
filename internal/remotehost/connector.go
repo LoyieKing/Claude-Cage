@@ -126,10 +126,17 @@ func connect(lifetime context.Context, p HostProfile, secrets ConnectSecrets, ph
 	if err != nil {
 		return nil, err
 	}
+	if secrets.AttachOnly && onAttachDial != nil {
+		onAttachDial(lifetime)
+		if lifetime.Err() != nil {
+			return nil, failure("connection_cancelled", "远程连接已取消")
+		}
+	}
 	bootstrap, cancelBootstrap := context.WithTimeout(lifetime, 45*time.Second)
 	defer cancelBootstrap()
 	phase("ssh_auth")
 	auth, cleanup, err := authentication(bootstrap, p, secrets)
+	clear(secrets.Passphrase)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +203,7 @@ func connect(lifetime context.Context, p HostProfile, secrets ConnectSecrets, ph
 	defer cancelReady()
 	stopReady := context.AfterFunc(ready, func() { client.Close() })
 	defer stopReady()
-	output, err := cloudEntry(ready, client, p, secrets.Deploy, phase)
+	output, err := cloudEntry(ready, client, p, secrets.Deploy && !secrets.AttachOnly, secrets.AttachOnly, phase)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +219,9 @@ func connect(lifetime context.Context, p HostProfile, secrets ConnectSecrets, ph
 	}
 	if err = ValidateManifest(manifest); err != nil {
 		return nil, err
+	}
+	if secrets.ExpectInstanceID != "" && manifest.InstanceID != secrets.ExpectInstanceID {
+		return nil, failure("instance_changed", "云端 Cage 实例已变化，已停止自动重连。请核对主机身份后重新连接。")
 	}
 	origin, _ := url.Parse(manifest.Origin)
 	targetHost := origin.Hostname()
@@ -230,11 +240,22 @@ func connect(lifetime context.Context, p HostProfile, secrets ConnectSecrets, ph
 	bound := &sessionTransport{base: transport, jar: jar, origin: manifest.Origin, ctx: life}
 	var once sync.Once
 	s := &Session{Manifest: manifest.Public(), Transport: bound, Context: life, Origin: manifest.Origin}
+	shutdown := func() {
+		once.Do(func() {
+			cancelLife()
+			client.Close()
+			transport.CloseIdleConnections()
+			bound.closeStreams()
+		})
+	}
 	s.close = func() error {
-		once.Do(func() { cancelLife(); transport.CloseIdleConnections(); client.Close() })
+		shutdown()
 		return nil
 	}
-	bound.invalidate = s.Close
+	bound.invalidate = func() error {
+		s.mark("remote_session_expired")
+		return s.Close()
+	}
 	s.Client = &http.Client{Transport: bound, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return failure("redirect_refused", "云端服务重定向已拒绝")
 	}}
@@ -260,20 +281,118 @@ func connect(lifetime context.Context, p HostProfile, secrets ConnectSecrets, ph
 	}
 	stopReady()
 	complete = true
-	go func() { _ = client.Wait(); s.Close() }()
-	context.AfterFunc(life, func() { s.Close() })
+	interval, timeout := heartbeatInterval, heartbeatTimeout
+	var helpers sync.WaitGroup
+	helpers.Add(2)
+	s.close = func() error {
+		shutdown()
+		helpers.Wait()
+		return nil
+	}
+	go func() {
+		defer helpers.Done()
+		_ = client.Wait()
+		shutdown()
+	}()
+	go func() {
+		defer helpers.Done()
+		watchHeartbeat(life, client, interval, timeout, shutdown)
+	}()
+	context.AfterFunc(life, func() { _ = s.Close() })
 	return s, nil
 }
 
 type sessionTransport struct {
-	base       *http.Transport
-	jar        http.CookieJar
-	origin     string
-	ctx        context.Context
-	invalidate func() error
+	base          *http.Transport
+	jar           http.CookieJar
+	origin        string
+	ctx           context.Context
+	invalidate    func() error
+	mu            sync.Mutex
+	streams       []io.Closer
+	streamsClosed bool
+	armOnce       sync.Once
+}
+
+func (t *sessionTransport) arm() {
+	t.armOnce.Do(func() {
+		if t.ctx == nil {
+			return
+		}
+		context.AfterFunc(t.ctx, func() { t.closeStreams() })
+	})
+}
+
+func (t *sessionTransport) track(body io.Closer) {
+	t.mu.Lock()
+	closed := t.streamsClosed
+	if !closed {
+		t.streams = append(t.streams, body)
+	}
+	t.mu.Unlock()
+	if closed {
+		body.Close()
+	}
+}
+
+func (t *sessionTransport) untrack(body io.Closer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, item := range t.streams {
+		if item == body {
+			t.streams = append(t.streams[:i], t.streams[i+1:]...)
+			return
+		}
+	}
+}
+
+func (t *sessionTransport) closeStreams() {
+	t.mu.Lock()
+	t.streamsClosed = true
+	all := t.streams
+	t.streams = nil
+	t.mu.Unlock()
+	for _, body := range all {
+		body.Close()
+	}
+}
+
+func watchHeartbeat(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, lost func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := pingSSH(client, timeout); err != nil {
+				lost()
+				return
+			}
+		}
+	}
+}
+
+func pingSSH(client *ssh.Client, timeout time.Duration) error {
+	finished := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		finished <- err
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-finished:
+		return err
+	case <-timer.C:
+		_ = client.Close()
+		<-finished
+		return errors.New("ssh heartbeat timeout")
+	}
 }
 
 func (t *sessionTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.arm()
 	if request.URL.Scheme+"://"+request.URL.Host != t.origin || request.URL.User != nil {
 		return nil, failure("origin_refused", "拒绝访问云端声明之外的服务")
 	}
@@ -317,47 +436,75 @@ func (t *sessionTransport) RoundTrip(request *http.Request) (*http.Response, err
 		return nil, failure("redirect_refused", "云端服务重定向已拒绝")
 	}
 	if rw, ok := response.Body.(io.ReadWriteCloser); ok {
-		response.Body = &cancelReadWriteCloser{ReadWriteCloser: rw, finish: finish}
+		wrapped := &cancelReadWriteCloser{ReadWriteCloser: rw, finish: finish}
+		wrapped.release = func() { t.untrack(wrapped) }
+		response.Body = wrapped
+		t.track(wrapped)
 	} else {
-		response.Body = &cancelReadCloser{ReadCloser: response.Body, finish: finish}
+		wrapped := &cancelReadCloser{ReadCloser: response.Body, finish: finish}
+		wrapped.release = func() { t.untrack(wrapped) }
+		response.Body = wrapped
+		t.track(wrapped)
 	}
 	return response, nil
 }
 
 type cancelReadCloser struct {
 	io.ReadCloser
-	finish func()
-	once   sync.Once
+	finish      func()
+	release     func()
+	once        sync.Once
+	releaseOnce sync.Once
 }
 
 func (b *cancelReadCloser) Read(p []byte) (int, error) {
 	n, e := b.ReadCloser.Read(p)
 	if e != nil {
 		b.once.Do(b.finish)
+		b.retire()
 	}
 	return n, e
+}
+func (b *cancelReadCloser) retire() {
+	b.releaseOnce.Do(func() {
+		if b.release != nil {
+			b.release()
+		}
+	})
 }
 func (b *cancelReadCloser) Close() error {
 	err := b.ReadCloser.Close()
 	b.once.Do(b.finish)
+	b.retire()
 	return err
 }
 
 type cancelReadWriteCloser struct {
 	io.ReadWriteCloser
-	finish func()
-	once   sync.Once
+	finish      func()
+	release     func()
+	once        sync.Once
+	releaseOnce sync.Once
 }
 
 func (b *cancelReadWriteCloser) Read(p []byte) (int, error) {
 	n, e := b.ReadWriteCloser.Read(p)
 	if e != nil {
 		b.once.Do(b.finish)
+		b.retire()
 	}
 	return n, e
+}
+func (b *cancelReadWriteCloser) retire() {
+	b.releaseOnce.Do(func() {
+		if b.release != nil {
+			b.release()
+		}
+	})
 }
 func (b *cancelReadWriteCloser) Close() error {
 	err := b.ReadWriteCloser.Close()
 	b.once.Do(b.finish)
+	b.retire()
 	return err
 }

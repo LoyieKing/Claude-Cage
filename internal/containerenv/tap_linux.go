@@ -22,6 +22,18 @@ func RunTAP(ctx context.Context, input io.Reader, output io.Writer) error {
 	if err := requirePrivateGuestNetwork(); err != nil {
 		return err
 	}
+	// Exclusive ownership of the guest TAP. Never steal another helper's
+	// descriptor or delete its interface; wait only after this process holds
+	// the lock and the previous owner has exited.
+	lockFile, err := os.OpenFile("/run/cage-tap.lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return errors.New("容器 TAP 已由其他进程持有")
+	}
+	defer unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
 	// A disconnected engine exec can take a moment to deliver EOF to its old
 	// helper. Wait for that non-persistent TAP to vanish; never delete an
 	// interface or take over another process's file descriptor.

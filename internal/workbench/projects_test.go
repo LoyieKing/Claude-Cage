@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 
-	"al.essio.dev/pkg/shellescape"
 	"os"
 	"path/filepath"
 	"testing"
@@ -256,14 +255,11 @@ func TestProjectActionsUseExplicitDirectoryWithoutSwitchingProject(t *testing.T)
 	// The absent SSH config makes this local child exit before connecting.
 	body, _ := json.Marshal(map[string]string{"workspace": a})
 	w := request(s, "POST", "/api/terminals", s.origin, string(body), true)
-	var terminal struct{ ID, Workspace string }
-	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &terminal) != nil || terminal.Workspace != a {
-		t.Fatalf("terminal did not use the explicit directory: %s", w.Body.String())
-	}
-	session := s.terminals.get(terminal.ID)
-	defer session.close()
-	if script := session.cmd.Args[len(session.cmd.Args)-1]; !strings.HasPrefix(script, "cd "+shellescape.Quote(guestPath(a))+" &&") {
-		t.Fatalf("terminal command opened a different directory: %s", script)
+	// This fixture has no guest shell service. Creating a terminal must still
+	// authorize the explicit directory before any guest command, and must not
+	// switch the selected project when the guest command cannot start.
+	if w.Code == http.StatusOK || s.workspace() != b {
+		t.Fatalf("terminal create without a guest shell changed the project or reported success: %d %s", w.Code, w.Body.String())
 	}
 	var editorWorkspace string
 	s.browserControl = browserClientForTest(t, s, browserTransport(func(r *http.Request) (*http.Response, error) {
@@ -291,7 +287,7 @@ func TestProjectActionsUseExplicitDirectoryWithoutSwitchingProject(t *testing.T)
 			}
 		}
 	}
-	if len(s.terminals.snapshot()) != 1 || s.workspace() != b {
-		t.Fatal("rejected requests changed existing sessions")
+	if len(s.terminals.snapshot()) != 0 || s.workspace() != b {
+		t.Fatal("rejected requests changed the selected project or left a session")
 	}
 }

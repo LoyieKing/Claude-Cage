@@ -5,6 +5,7 @@ import (
 	"encoding"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 )
 
@@ -13,9 +14,17 @@ import (
 type conn struct {
 	io.Reader
 	io.WriteCloser
+	// transport is set when Reader and WriteCloser are one stream the
+	// constructor knows is shared. Close calls it once and does not compare
+	// the two fields. Nil means the sides are closed separately.
+	transport io.Closer
 	// this is the same allocator used in packet manager
-	alloc      *allocator
-	sync.Mutex // used to serialise writes to sendPacket
+	alloc *allocator
+	// writeMu serialises packet bytes. Close must not take it: a blocked
+	// Write has to be interruptible by closing the transport.
+	writeMu   sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // the orderID is used in server mode if the allocator is enabled.
@@ -27,16 +36,50 @@ func (c *conn) recvPacket(orderID uint32) (fxp, []byte, error) {
 }
 
 func (c *conn) sendPacket(m encoding.BinaryMarshaler) error {
-	c.Lock()
-	defer c.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
 	return sendPacket(c, m)
 }
 
+// Close interrupts a blocked send without waiting for writeMu. The stream
+// must allow concurrent Close and Write (net.Conn, ssh.Channel, io.Pipe).
+// A shared transport is closed once. Otherwise a distinct read closer is
+// closed too, so a blocked Read cannot outlive Close.
 func (c *conn) Close() error {
-	c.Lock()
-	defer c.Unlock()
-	return c.WriteCloser.Close()
+	c.closeOnce.Do(func() {
+		if c.transport != nil {
+			c.closeErr = c.transport.Close()
+			return
+		}
+		if c.WriteCloser != nil {
+			c.closeErr = c.WriteCloser.Close()
+		}
+		rc, ok := c.Reader.(io.Closer)
+		if ok && !closersEqual(rc, c.WriteCloser) {
+			if err := rc.Close(); c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
+	})
+	return c.closeErr
+}
+
+// closersEqual reports whether a and b are the same closer. Only values
+// reflect.Value.Comparable accepts are compared; that walks interface fields
+// to the dynamic value. A struct of interfaces is a comparable type even when
+// the value inside would panic on ==. Non-comparable values are not equal
+// here, so the caller closes both. Funcs are never compared: Pointer is the
+// code address, not the closure.
+func closersEqual(a, b io.Closer) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if !va.IsValid() || !vb.IsValid() || !va.Comparable() || !vb.Comparable() {
+		return false
+	}
+	return va.Equal(vb)
 }
 
 type clientConn struct {

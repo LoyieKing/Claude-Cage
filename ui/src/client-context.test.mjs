@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { api, native } from "./api.js";
 import { clientKeyboard, clientStorageKey, runtimeURL, setClientContext } from "./client-context.mjs";
+import { recoveryDecision, transportGeneration } from "./client-context.mjs";
 
 function environment(t) {
   const saved = { fetch: globalThis.fetch, window: globalThis.window, location: globalThis.location };
@@ -162,6 +163,56 @@ test("stream URLs carry the generation while layout follows the persistent insta
   assert.equal(clientStorageKey("cage-tab-layout"), key);
   setClientContext({ mode: "remote", connection_id: "other", instance_id: "instance-two" });
   assert.notEqual(clientStorageKey("cage-tab-layout"), key);
+});
+
+test("outer reconnect adopts the same instance without replaying or sending a retired SSH id", (t) => {
+  environment(t);
+  const previous = {
+    mode: "remote", desktop_gateway: true, connection_id: "ssh-old", instance_id: "instance-one",
+    connection: { state: "connected", connection_id: "ssh-old", instance_id: "instance-one" },
+  };
+  const next = {
+    ...previous, connection_id: "ssh-new",
+    connection: { state: "connected", connection_id: "ssh-new", instance_id: "instance-one" },
+  };
+  assert.deepEqual(recoveryDecision(previous, next), { reload: true, reattachReadonly: false, dropPending: true });
+  assert.deepEqual(recoveryDecision(previous, { ...previous, connection: { ...previous.connection, state: "reconnecting" } }), {
+    reload: false, reattachReadonly: false, dropPending: false,
+  });
+  setClientContext(next);
+  assert.equal(runtimeURL("/browser/events"), "/api/browser/events?connection=ssh-new");
+  assert.equal(transportGeneration(), "ssh-new");
+  const simplePrevious = { mode: "remote", connection_id: "ssh-old", instance_id: "instance-one", connection: { connection_id: "ssh-old" } };
+  const simpleNext = { mode: "remote", connection_id: "ssh-new", instance_id: "instance-one", connection: { connection_id: "ssh-new" } };
+  assert.equal(recoveryDecision(simplePrevious, simpleNext).reload, true);
+  assert.equal(recoveryDecision(simplePrevious, { ...simpleNext, instance_id: "instance-two" }).reload, true);
+  assert.equal(recoveryDecision(simplePrevious, { mode: "local", connection_id: "local" }).reload, true);
+});
+
+test("a late API or native result cannot continue on the same instance after the transport id rotates", async (t) => {
+  environment(t);
+  let release;
+  globalThis.fetch = () => new Promise((resolve) => { release = resolve; });
+  const pending = api("/input/files/create", { target: "browser" });
+  setClientContext({
+    mode: "remote", desktop_gateway: true, connection_id: "ssh-new", instance_id: "instance-one",
+    connection: { state: "connected", connection_id: "ssh-new", instance_id: "instance-one" },
+  });
+  release(new Response(JSON.stringify({ id: "old-upload" })));
+  await assert.rejects(pending, (error) => error.code === "connection_changed");
+  let nativeRelease;
+  window.webkit.messageHandlers.cage.postMessage = () => new Promise((resolve) => { nativeRelease = resolve; });
+  setClientContext({
+    mode: "remote", desktop_gateway: true, connection_id: "ssh-old", instance_id: "instance-one",
+    connection: { state: "connected", connection_id: "ssh-old", instance_id: "instance-one" },
+  });
+  const picked = native("chooseUploadFiles", { multiple: true });
+  setClientContext({
+    mode: "remote", desktop_gateway: true, connection_id: "ssh-new", instance_id: "instance-one",
+    connection: { state: "connected", connection_id: "ssh-new", instance_id: "instance-one" },
+  });
+  nativeRelease({ fileSelection: "old-file-handle", count: 1 });
+  await assert.rejects(picked, (error) => error.code === "connection_changed");
 });
 
 test("remote keyboard defaults follow the client and a saved choice does not alter server settings", (t) => {

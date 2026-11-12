@@ -16,7 +16,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { api, native, nativeAvailable } from "./api";
-import { setClientContext } from "./client-context.mjs";
+import { recoveryDecision, setClientContext } from "./client-context.mjs";
 import { Modal } from "./modal";
 import { HostForm } from "./remote-host-form";
 import logo from "./logo.png";
@@ -24,8 +24,6 @@ import "./remote-hosts.css";
 
 const Navigation = createContext(null);
 export const useSSHNavigation = () => useContext(Navigation);
-const identity = (context) =>
-  `${context.mode}:${context.connection_id || "disconnected"}`;
 const occupied = (status) =>
   Boolean(status?.running || status?.busy || status?.live_terminals);
 const unknown = () => ({ known: false, message: "本机状态待确认" });
@@ -56,7 +54,7 @@ function localSummary(status) {
 export function ClientRoot({ children }) {
   const [context, setContext] = useState(null);
   const [error, setError] = useState("");
-  const currentIdentity = useRef(null);
+  const previousContext = useRef(null);
   const mounted = useRef(false);
   const serial = useRef(0);
   const refresh = useCallback(async () => {
@@ -65,14 +63,14 @@ export function ClientRoot({ children }) {
     if (!mounted.current || query !== serial.current) return value;
     if (!["none", "local", "remote"].includes(value.mode))
       throw new Error("客户端未返回有效的工作环境，请更新 Cage。");
-    const next = identity(value);
-    if (currentIdentity.current && currentIdentity.current !== next) {
+    const decision = recoveryDecision(previousContext.current, value);
+    previousContext.current = value;
+    setClientContext(value);
+    if (decision.reload) {
       // Destroy callbacks, local files in flight and input handlers from the previous generation.
       location.reload();
       return value;
     }
-    currentIdentity.current = next;
-    setClientContext(value);
     setContext(value);
     setError("");
     return value;
@@ -129,10 +127,12 @@ function Environment({ context, refresh, children }) {
   const gateway = Boolean(context.desktop_gateway);
   const local = context.mode === "local" && !context.client_only;
   const remote = context.mode === "remote";
-  const active = context.connection?.state === "connected" && remote;
+  const liveConnection = context.connection;
+  const reconnecting = remote && liveConnection?.state === "reconnecting";
+  const active = remote && liveConnection?.state === "connected";
   const localLost =
     gateway && local && context.connection?.state !== "connected";
-  const ready = (local && !localLost) || active;
+  const ready = (local && !localLost) || active || reconnecting;
   const [expanded, setExpanded] = useState(false);
   const [hosts, setHosts] = useState([]);
   const [selected, setSelected] = useState(context.host_id || recent());
@@ -160,9 +160,10 @@ function Environment({ context, refresh, children }) {
   const candidate = gateway ? context.candidate : null;
   const verifying = candidate?.connection?.state === "connecting";
   const connection =
-    candidate?.connection || (!gateway ? context.connection : null);
+    candidate?.connection ||
+    (!gateway || liveConnection?.state !== "connected" ? liveConnection : null);
   const host = hosts.find((item) => item.id === selected);
-  const hostConnected = Boolean(active && host?.id === context.host_id);
+  const hostConnected = Boolean((active || reconnecting) && host?.id === context.host_id);
   const connectionHostID = connection?.host_id || candidate?.host_id;
   const pinnedFailure =
     connectionHostID === selected &&
@@ -364,6 +365,7 @@ function Environment({ context, refresh, children }) {
       }
       if (
         progress.connection?.state === "failed" ||
+        progress.connection?.state === "needs_auth" ||
         progress.connection?.state === "disconnected"
       ) {
         if (item && secret && (progress.connection?.host_key || progress.connection?.error_code === "deployment_required"))
@@ -491,7 +493,7 @@ function Environment({ context, refresh, children }) {
         <strong>{ready ? hostName : "Cage"}</strong>
         {ready && (
           <span className="client-toolbar-hint">
-            {remote ? "SSH · 云端运行" : "当前工作环境"}
+            {reconnecting ? "正在重新连接 · 未完成的操作不会重试" : remote ? "SSH · 云端运行" : "当前工作环境"}
           </span>
         )}
         {ready && !showHosts && (
@@ -587,8 +589,8 @@ function Environment({ context, refresh, children }) {
                       {item.user}@{item.host}:{item.port}
                     </small>
                   </span>
-                  {context.host_id === item.id && active && (
-                    <Check size={15} aria-label="已连接" />
+                  {context.host_id === item.id && (active || reconnecting) && (
+                    <Check size={15} aria-label={reconnecting ? "正在重新连接" : "已连接"} />
                   )}
                 </button>
               ))}
@@ -682,7 +684,7 @@ function Environment({ context, refresh, children }) {
                   {error}
                 </p>
               )}
-              {connection?.state === "failed" &&
+              {["failed", "needs_auth"].includes(connection?.state) && !reconnecting &&
                 (!connectionHostID || connectionHostID === selected) && (
                   <div className="ssh-connection" role="alert">
                     <strong>
@@ -708,7 +710,7 @@ function Environment({ context, refresh, children }) {
                     )}
                   </div>
                 )}
-              {remote && !active && !connection?.message && (
+              {remote && !active && !reconnecting && !connection?.message && (
                 <p className="ssh-help" role="status">
                   连接已断开。请重新连接并核对云端任务。
                 </p>

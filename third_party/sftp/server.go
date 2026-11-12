@@ -94,6 +94,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		conn: conn{
 			Reader:      rwc,
 			WriteCloser: rwc,
+			transport:   rwc,
 		},
 	}
 	s := &Server{

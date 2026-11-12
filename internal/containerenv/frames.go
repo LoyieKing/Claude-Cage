@@ -6,13 +6,30 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 )
+
+// guestSourceMAC is parsed once. Every frame still compares the Ethernet
+// source; the comparison itself no longer allocates.
+var guestSourceMAC = func() net.HardwareAddr {
+	mac, err := net.ParseMAC(GuestMAC)
+	if err != nil {
+		panic(err)
+	}
+	return append(net.HardwareAddr(nil), mac...)
+}()
 
 // A compromised guest can replace its helper. Validate framing again before
 // the shared netstack allocates packets or indexes the Ethernet header.
 type boundedFrameConnection struct {
 	net.Conn
 	pending []byte
+	buffer  []byte
+	mac     net.HardwareAddr
+}
+
+func newBoundedFrameConnection(conn net.Conn) *boundedFrameConnection {
+	return &boundedFrameConnection{Conn: conn, buffer: make([]byte, 4+maxFrameSize), mac: guestSourceMAC}
 }
 
 func (c *boundedFrameConnection) Read(output []byte) (int, error) {
@@ -20,17 +37,17 @@ func (c *boundedFrameConnection) Read(output []byte) (int, error) {
 		return 0, nil
 	}
 	if len(c.pending) == 0 {
-		buffer := make([]byte, maxFrameSize+4)
-		frame, err := readFrame(c.Conn, buffer[4:])
+		// pending aliases c.buffer and is empty here, so the next frame can
+		// reuse the same validation buffer.
+		frame, err := readFrame(c.Conn, c.buffer[4:4+maxFrameSize])
 		if err != nil {
 			return 0, err
 		}
-		mac, _ := net.ParseMAC(GuestMAC)
-		if !bytes.Equal(frame[6:12], mac) {
+		if len(frame) < 12 || !bytes.Equal(frame[6:12], c.mac) {
 			return 0, errors.New("unexpected container Ethernet source")
 		}
-		binary.BigEndian.PutUint32(buffer[:4], uint32(len(frame)))
-		c.pending = buffer[:4+len(frame)]
+		binary.BigEndian.PutUint32(c.buffer[:4], uint32(len(frame)))
+		c.pending = c.buffer[:4+len(frame)]
 	}
 	n := copy(output, c.pending)
 	c.pending = c.pending[n:]
@@ -41,16 +58,25 @@ func (c *boundedFrameConnection) Read(output []byte) (int, error) {
 // the small allowance includes Ethernet/VLAN headers above the configured MTU.
 const maxFrameSize = NetworkMTU + 64
 
+var frameBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, 4+maxFrameSize)
+	return &buffer
+}}
+
 func writeFrame(writer io.Writer, frame []byte) error {
 	if len(frame) < 14 || len(frame) > maxFrameSize {
 		return errors.New("invalid container Ethernet frame length")
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(frame)))
-	if err := writeAll(writer, header[:]); err != nil {
-		return err
-	}
-	return writeAll(writer, frame)
+	return writeGather(writer, header[:], frame)
+}
+
+// writeGather copies the header and payload once and writes them through the
+// writer. os.File.Write stays on the runtime poller, so Close and deadlines
+// unblock a full pipe. A raw writev on File.Fd would drop that contract.
+func writeGather(writer io.Writer, header, payload []byte) error {
+	return writeCombined(writer, header, payload)
 }
 
 func readFrame(reader io.Reader, buffer []byte) ([]byte, error) {
@@ -65,6 +91,20 @@ func readFrame(reader io.Reader, buffer []byte) ([]byte, error) {
 	frame := buffer[:int(size)]
 	_, err := io.ReadFull(reader, frame)
 	return frame, err
+}
+
+func writeCombined(writer io.Writer, header, payload []byte) error {
+	boxed := frameBufferPool.Get().(*[]byte)
+	buffer := *boxed
+	if cap(buffer) < 4+len(payload) {
+		buffer = make([]byte, 4+maxFrameSize)
+	}
+	n := copy(buffer, header)
+	n += copy(buffer[n:], payload)
+	err := writeAll(writer, buffer[:n])
+	*boxed = buffer
+	frameBufferPool.Put(boxed)
+	return err
 }
 
 func writeAll(writer io.Writer, data []byte) error {

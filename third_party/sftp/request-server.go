@@ -10,6 +10,7 @@ import (
 	rdebug "runtime/debug"
 	"strconv"
 	"sync"
+	"time"
 )
 
 const defaultMaxTxPacket uint32 = 1 << 15
@@ -36,6 +37,11 @@ type RequestServer struct {
 	mu           sync.RWMutex
 	handleCount  int
 	openRequests map[string]*Request
+
+	lifeMu  sync.Mutex
+	cancel  context.CancelFunc
+	started bool // Serve has taken responsibility for reaping pktMgr
+	closed  bool
 }
 
 // A RequestServerOption is a function which applies configuration to a RequestServer.
@@ -97,6 +103,24 @@ func WithRSSequential() RequestServerOption {
 	}
 }
 
+// WithRSWriteTimeout bounds one response packet write by d. The deadline runs
+// only during that send and resets when the send completes; partial writes
+// within the same packet do not extend it. Idle reads are not closed. Serve returns
+// context.DeadlineExceeded (not io.EOF) and the underlying stream is closed,
+// which unblocks both a blocked Write and a blocked Read. d <= 0 disables the
+// deadline and keeps the historical wait-until-Close behavior. Apply this
+// option to NewRequestServer before Serve, the same way as WithRSSequential.
+// Confined servers should pass their own limit (typically 30s); the library
+// default stays off for compatibility.
+func WithRSWriteTimeout(d time.Duration) RequestServerOption {
+	return func(rs *RequestServer) {
+		if d < 0 {
+			d = 0
+		}
+		rs.pktMgr.writeTimeout = d
+	}
+}
+
 // NewRequestServer creates/allocates/returns new RequestServer.
 // Normally there will be one server per user-session.
 func NewRequestServer(rwc io.ReadWriteCloser, h Handlers, options ...RequestServerOption) *RequestServer {
@@ -104,6 +128,7 @@ func NewRequestServer(rwc io.ReadWriteCloser, h Handlers, options ...RequestServ
 		conn: conn{
 			Reader:      rwc,
 			WriteCloser: rwc,
+			transport:   rwc,
 		},
 	}
 	rs := &RequestServer{
@@ -175,10 +200,26 @@ func (rs *RequestServer) closeRequest(handle string) error {
 	return EBADF
 }
 
-// Close the read/write/closer to trigger exiting the main server loop
-func (rs *RequestServer) Close() error { return rs.conn.Close() }
+// Close interrupts a blocked send without taking the send lock, cancels
+// in-flight handlers, and reaps the packet manager when Serve never started.
+func (rs *RequestServer) Close() error {
+	rs.lifeMu.Lock()
+	rs.closed = true
+	started := rs.started
+	cancel := rs.cancel
+	rs.lifeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	err := rs.conn.Close()
+	rs.pktMgr.requestStop()
+	if !started {
+		rs.pktMgr.shutdown()
+	}
+	return err
+}
 
-func (rs *RequestServer) serveLoop(pktChan chan<- orderedRequest) error {
+func (rs *RequestServer) serveLoop(ctx context.Context, pktChan chan<- orderedRequest) error {
 	defer close(pktChan) // shuts down sftpServerWorkers
 
 	var err error
@@ -200,12 +241,21 @@ func (rs *RequestServer) serveLoop(pktChan chan<- orderedRequest) error {
 				// do nothing
 			default:
 				debug("makePacket err: %v", err)
-				rs.conn.Close() // shuts down recvPacket
 				return err
 			}
 		}
 
-		pktChan <- rs.pktMgr.newOrderedRequest(pkt)
+		req := rs.pktMgr.newOrderedRequest(pkt)
+		select {
+		case pktChan <- req:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-rs.pktMgr.done:
+			if ferr := rs.pktMgr.fatalErr(); ferr != nil {
+				return ferr
+			}
+			return io.ErrClosedPipe
+		}
 	}
 }
 
@@ -217,8 +267,19 @@ func (rs *RequestServer) Serve() error {
 		}
 	}()
 
+	rs.lifeMu.Lock()
+	if rs.closed {
+		rs.lifeMu.Unlock()
+		return io.ErrClosedPipe
+	}
 	ctx, cancel := context.WithCancel(context.Background())
+	rs.cancel = cancel
+	rs.started = true
+	rs.lifeMu.Unlock()
 	defer cancel()
+
+	// Writer failures cancel handlers. fail also closes the transport.
+	rs.pktMgr.onFatal = func(error) { cancel() }
 
 	var wg sync.WaitGroup
 	runWorker := func(ch chan orderedRequest) {
@@ -226,15 +287,32 @@ func (rs *RequestServer) Serve() error {
 		go func() {
 			defer wg.Done()
 			if err := rs.packetWorker(ctx, ch); err != nil {
-				rs.conn.Close() // shuts down recvPacket
+				rs.pktMgr.fail(err)
 			}
 		}()
 	}
 	pktChan := rs.pktMgr.workerChan(runWorker)
 
-	err := rs.serveLoop(pktChan)
+	err := rs.serveLoop(ctx, pktChan)
+	// Clean EOF stays EOF so open handles can convert it. Any other
+	// read/protocol error cancels the session. A send error recorded by
+	// the writer wins over the read error caused by closing the transport.
+	if err != nil && !errors.Is(err, io.EOF) {
+		rs.pktMgr.fail(err)
+	}
 
-	wg.Wait() // wait for all workers to exit
+	wg.Wait() // workers finish before open-handle cleanup
+	if rs.pktMgr.dispatchDone != nil {
+		<-rs.pktMgr.dispatchDone
+	}
+	rs.pktMgr.shutdown()
+
+	// Closing the transport after a failed send often makes the blocked read
+	// return io.EOF. That EOF is a consequence of the send failure, not a
+	// clean peer shutdown, so the send error wins.
+	if ferr := rs.pktMgr.fatalErr(); ferr != nil {
+		err = ferr
+	}
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -256,6 +334,10 @@ func (rs *RequestServer) Serve() error {
 
 func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedRequest) error {
 	for pkt := range pktChan {
+		if ctx.Err() != nil {
+			rs.pktMgr.drop(pkt)
+			continue
+		}
 		orderID := pkt.orderID()
 		if epkt, ok := pkt.requestPacket.(*sshFxpExtendedPacket); ok {
 			if epkt.SpecificPacket != nil {

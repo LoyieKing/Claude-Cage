@@ -84,7 +84,7 @@ func startWindowsProjectTransport(cmd *exec.Cmd, hostPath string, binding window
 	}
 	admitted = true
 	binding.Path = started.Path
-	share := &projectShare{cmd: cmd, transport: projectTransport{bufferedProjectOutput{reader, output}, input}, done: make(chan struct{}), windowsProject: &binding}
+	share := &projectShare{cmd: cmd, transport: projectTransport{ReadCloser: bufferedProjectOutput{reader, output}, WriteCloser: input}, done: make(chan struct{}), windowsProject: &binding}
 	go func() {
 		defer close(share.done)
 		_ = reversesshfs.ServeConfinedVirtual(share.transport, hostPath, false, nil)

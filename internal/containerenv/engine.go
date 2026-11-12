@@ -28,6 +28,12 @@ type State struct {
 	PIDs              int64  `json:"pids"`
 	MountsReady       bool   `json:"mounts_ready"`
 	MountError        string `json:"mount_error,omitempty"`
+	NetworkReady      bool   `json:"network_ready"`
+	Shared            bool   `json:"shared"`
+	ShareStatus       string `json:"share_status,omitempty"`
+	NetworkStatus     string `json:"network_status,omitempty"`
+	Intent            string `json:"intent,omitempty"`
+	IntentGeneration  uint64 `json:"intent_generation,omitempty"`
 }
 
 type Inspection struct {
@@ -150,7 +156,9 @@ func (r *Runtime) State(ctx context.Context) (State, error) {
 	}
 	if container == nil {
 		storage, err := r.StoragePath(ctx)
-		return State{CPUs: r.config.CPUs, MemoryBytes: r.config.MemoryBytes, StoragePath: storage}, err
+		state := State{CPUs: r.config.CPUs, MemoryBytes: r.config.MemoryBytes, StoragePath: storage}
+		r.annotateIntent(&state)
+		return state, err
 	}
 	state := State{Exists: true, Running: container.State.Running, ContainerID: container.ID, PID: container.State.Pid, MemoryBytes: container.HostConfig.Memory, CPUs: int(container.HostConfig.NanoCpus / 1e9)}
 	state.StoragePath, err = r.StoragePath(ctx)
@@ -176,11 +184,10 @@ func (r *Runtime) State(ctx context.Context) (State, error) {
 			state.ResourcesVerified = true
 		}
 		if record, err := r.networkState(ctx, container.ID); err == nil {
-			state.Ready = state.ResourcesVerified && state.MountsReady
-			state.BrowserAddress = record.BrowserAddress
-			state.VNCAddress = record.VNCAddress
+			applyNetworkRecord(&state, record)
 		}
 	}
+	r.annotateIntent(&state)
 	return state, nil
 }
 
@@ -321,13 +328,16 @@ func (r *Runtime) Inspect(ctx context.Context) (Inspection, error) {
 		result.State.PIDs = resources.PIDs
 		result.State.ResourcesVerified = true
 		if record, err := r.networkState(ctx, container.ID); err == nil {
-			result.State.Ready = mounts.Ready()
-			result.State.BrowserAddress = record.BrowserAddress
-			result.State.VNCAddress = record.VNCAddress
+			applyNetworkRecord(&result.State, record)
 			result.NetworkConfined = true
 			result.FilesystemConfined = mounts.Ready()
-			result.Evidence = "实际 rootless 容器无默认网络或宿主目录挂载；当前外置网络门槛身份已验证，唯一 TAP 通道由宿主接收；默认项目经受限 SFTP 共享并完成双端读写验证"
+			if result.State.Shared {
+				result.Evidence = "实际 rootless 容器无默认网络或宿主目录挂载；当前外置网络门槛身份已验证，唯一 TAP 通道由宿主接收；默认项目经受限 SFTP 共享并完成双端读写验证"
+			} else {
+				result.Evidence = "实际 rootless 容器无默认网络或宿主目录挂载；当前外置网络门槛身份已验证，唯一 TAP 通道由宿主接收；默认项目共享尚未就绪"
+			}
 		}
 	}
+	r.annotateIntent(&result.State)
 	return result, nil
 }

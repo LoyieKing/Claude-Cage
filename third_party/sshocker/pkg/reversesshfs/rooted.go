@@ -73,16 +73,33 @@ func newRootedServerAt(rwc io.ReadWriteCloser, localPath, exportedPath string, r
 	handlers := sftp.Handlers{FileGet: h, FilePut: h, FileCmd: h, FileList: h}
 	// Sequential, as OpenSSH's sftp-server: otherwise two writes to the same range, or a write
 	// and the FSTAT or FSETSTAT sent after it, can run in either order.
-	srv := sftp.NewRequestServer(rwc, handlers, sftp.WithStartDirectory(startDirectory(h.rootPath)), sftp.WithRSSequential(),
+	serverOpts := []sftp.RequestServerOption{
+		sftp.WithStartDirectory(startDirectory(h.rootPath)), sftp.WithRSSequential(),
 		// Each handle holds a file descriptor of this process, which may be the one running the VM.
 		sftp.WithRSMaxHandles(maxHandles),
 		// sshfs reads up to 64 KiB (max_read), and takes a shorter answer for the end of the file.
-		sftp.WithRSMaxTxPacket(64*1024))
+		sftp.WithRSMaxTxPacket(64 * 1024),
+		sftp.WithRSWriteTimeout(ConfinedWriteTimeout),
+	}
+	srv := sftp.NewRequestServer(rwc, handlers, serverOpts...)
 	return srv, h, nil
 }
 
 func (h *rootedHandlers) Close() error {
 	return errors.Join(h.root.Close(), h.rootedSys.close())
+}
+
+// sameOpenedRoot reports whether both handles opened for this server still
+// name identity. Callers must use it before Serve.
+func (h *rootedHandlers) sameOpenedRoot(identity os.FileInfo) bool {
+	if h == nil || h.root == nil || identity == nil {
+		return false
+	}
+	opened, err := h.root.Stat(".")
+	if err != nil || !os.SameFile(identity, opened) {
+		return false
+	}
+	return h.rootedSys.sameFile(identity)
 }
 
 // rel maps a request path to a path relative to the root.

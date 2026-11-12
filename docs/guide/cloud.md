@@ -55,6 +55,10 @@ keywords: 云端 远程部署 VPS SSH 无KVM rootless 服务器 主机 指纹 �
 
 切换主机后，旧连接的文件选择、输入和请求不能继续进入新主机。连接失败时不会自动改为操作本机。对发送、保存等结果不明确的操作，重连后先核对状态再重试。
 
+当前源码会用 SSH 心跳检测失联，并对已部署且运行中的同一服务有限退避重连。重连核对原主机配置、主机密钥和 Cage 实例身份，成功后更换连接代次并重新加载工作台；旧代次的请求和文件选择结果不会继续执行。自动重连不部署、启动或升级服务器环境，不重发未完成的 HTTP 修改、终端输入或文件写入。密钥口令需要重新输入、身份变化、会话失效或锁定需要处理时，自动恢复停止并显示原因。
+
+容器网络 worker 的恢复与项目共享、浏览器转发分别管理。网络 worker 重建后外网保持关闭，完整复检通过后才恢复原允许的联网意图，人工暂停不会被解除。已断开的公网 TCP 连接不能无损接续。Linux 持久终端的边界见[终端断线恢复](workbench.md#linux-终端与共享断线恢复)。本机目录共享仍需在新连接中重新授权。
+
 <figure class="guide-shot">
   <a href="../../www/public/docs/screenshots/ssh-install-paths.jpg" target="_blank" rel="noopener" aria-label="查看原图：自定义服务器上的程序与配置路径"><img src="../../www/public/docs/screenshots/ssh-install-paths.jpg" alt="自定义服务器上的程序与配置路径" width="2560" height="1764" loading="lazy" decoding="async" /></a>
   <figcaption>自定义服务器上的程序与配置路径。截图版本：0.1.6-alpha-preview（开发构建） · macOS 原生应用 · 2026-11-07。<a href="../../www/public/docs/screenshots/ssh-install-paths.jpg" target="_blank" rel="noopener">查看原图（2560 × 1764） ↗</a></figcaption>

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"al.essio.dev/pkg/shellescape"
 	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"golang.org/x/net/http/httpguts"
 )
@@ -83,7 +82,7 @@ func (s *Server) recoverClientMounts(ctx context.Context) error {
 	if initialized {
 		return nil
 	}
-	const recoverScript = `set -eu
+	recoverScript := `set -eu
 root=` + clientMountRoot + `
 [ ! -L "$root" ] || exit 1
 [ -d "$root" ] || exit 0
@@ -91,11 +90,12 @@ for p in "$root"/*; do
   [[ ${p##*/} =~ ^[a-f0-9]{32}$ ]] || continue
   [ ! -L "$p" ] || continue
   kind=$(findmnt -rn --nocanonicalize -o FSTYPE --mountpoint "$p") || kind=
-  case "$kind" in
-    fuse.sshfs) sudo -n umount -l -- "$p";;
-    "") ;;
+  src=$(findmnt -rn --nocanonicalize -o SOURCE --mountpoint "$p" 2>/dev/null) || src=
+  case "$kind:$src" in
+    fuse.sshfs:cage-client-` + exactMountHex() + `) sudo -n umount -- "$p" || sudo -n umount -l -- "$p" || true;;
     *) continue;;
   esac
+  if findmnt -rn --nocanonicalize --mountpoint "$p" >/dev/null 2>&1; then continue; fi
   sudo -n rmdir -- "$p" || true
 done`
 	if _, err := s.guest(ctx, recoverScript); err != nil {
@@ -164,18 +164,25 @@ func (s *Server) guestClientShare(w http.ResponseWriter, r *http.Request) {
 
 	// A disconnected mount exposes an inaccessible underlying directory until
 	// teardown removes it. Never let an old cwd accept writes into the cloud.
-	target := shellescape.Quote(path)
-	setup, finishSetup := context.WithTimeout(ctx, 10*time.Second)
-	_, err := s.guest(setup, "sudo -n install -d -m 0755 "+clientMountRoot+" && sudo -n mkdir -m 000 -- "+target)
+	// The grant ends with this request. It is not restored after reconnect.
+	fsname := clientMountPrefix + id
+	setup, finishSetup := context.WithTimeout(ctx, 20*time.Second)
+	client, err := s.dialGuestSSH(setup)
+	if err != nil {
+		finishSetup()
+		http.Error(w, "无法连接云端容器", http.StatusConflict)
+		return
+	}
+	err = prepareGuestMount(setup, client, path, fsname, clientMountPrefix)
 	finishSetup()
 	if err != nil {
+		_ = client.Close()
 		http.Error(w, "无法准备云端容器挂载位置", http.StatusConflict)
 		return
 	}
+	defer client.Close()
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = s.guest(ctx, "if findmnt -rn --nocanonicalize --mountpoint "+target+" >/dev/null; then sudo -n umount -l -- "+target+"; fi; sudo -n rmdir -- "+target)
+		s.retireClientMount(path, fsname)
 	}()
 	conn, buffer, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -183,50 +190,61 @@ func (s *Server) guestClientShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stopClose()
-	if _, err = buffer.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cage-sftp-v1\r\n\r\n"); err != nil || buffer.Flush() != nil {
-		return
-	}
-	// sshfs runs inside the guest. Its only SFTP transport is this stream.
-	// Keep normal mmap/read-ahead support for compilers and search tools.
-	// Present files as the guest user so ownership checks (e.g. Git) work
-	// when the workstation uses a different UID or Windows ACLs.
-	script := "exec sudo -n sshfs -f :/ " + target + ` -o "slave,allow_other,cache=no,nodev,nosuid,uid=$(id -u),gid=$(id -g)"`
-	cmd := s.sshCommand(ctx, "-T", s.sshTarget(), "--", script)
-	cmd.Stdout = conn
-	input, err := cmd.StdinPipe()
+	command, err := sshfsCommand(":/", path, fsname)
 	if err != nil {
 		return
 	}
-	defer input.Close()
-	if err = cmd.Start(); err != nil {
+	session, stdout, stdin, stopAttach, err := startGuestSSHFS(ctx, client, command)
+	if err != nil {
 		return
 	}
-	ingressDone := make(chan struct{})
+	toGuest := make(chan struct{})
+	toHost := make(chan struct{})
 	go func() {
-		defer close(ingressDone)
-		_, _ = io.Copy(input, buffer.Reader)
-		cancel()
+		defer close(toGuest)
+		_, _ = io.Copy(stdin, buffer.Reader)
 	}()
-	// Wait for the actual kernel mount and a successful SFTP stat before
-	// admitting any terminal, editor or Claude session to this workspace.
+	go func() {
+		defer close(toHost)
+		_, _ = io.Copy(conn, stdout)
+	}()
+	sessionDone := make(chan struct{})
+	waited := false
+	defer func() {
+		stopAttach()
+		_ = client.Close()
+		<-toGuest
+		<-toHost
+		if waited {
+			<-sessionDone
+		} else {
+			_ = session.Wait()
+		}
+	}()
+	if _, err = buffer.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cage-sftp-v1\r\n\r\n"); err != nil || buffer.Flush() != nil {
+		return
+	}
+	go func() {
+		_ = session.Wait()
+		close(sessionDone)
+	}()
+	waited = true
 	probed := make(chan struct{})
 	go func() {
 		defer close(probed)
 		probe, end := context.WithTimeout(ctx, 15*time.Second)
 		defer end()
-		verify := "until [ \"$(findmnt -n -o FSTYPE --mountpoint " + target + ")\" = fuse.sshfs ] && stat -- " + target + "/. >/dev/null 2>&1; do sleep 0.1; done"
-		if _, err := s.guest(probe, verify); err != nil {
-			cancel()
+		if err := waitGuestMount(probe, client, guestMountCheckScript(path, fsname, "", "")); err != nil {
+			_ = client.Close()
 			return
 		}
 		s.mu.Lock()
-		mount.ready = ctx.Err() == nil
+		mount.ready = ctx.Err() == nil && s.clientMounts[path] == mount
 		s.mu.Unlock()
 	}()
-	_ = cmd.Wait()
-	cancel()
-	<-ingressDone
+	select {
+	case <-ctx.Done():
+	case <-sessionDone:
+	}
 	<-probed
 }

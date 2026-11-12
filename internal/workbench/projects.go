@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"al.essio.dev/pkg/shellescape"
 	"github.com/lima-vm/sshocker/pkg/reversesshfs"
 )
 
@@ -33,6 +31,11 @@ func (s *Server) connectProject(path string, add bool) (string, error) {
 	}
 	if !add {
 		if path, err = s.projectWorkspace(path); err != nil {
+			return "", err
+		}
+	}
+	if add && !isClientMountPath(path) && path != s.environmentDir() && s.supportsLinuxProjectShare() {
+		if err = s.confirmProjectRoot(path); err != nil {
 			return "", err
 		}
 	}
@@ -134,9 +137,20 @@ func (s *Server) openProject(w http.ResponseWriter, r *http.Request) {
 type projectTransport struct {
 	io.ReadCloser
 	io.WriteCloser
+	// detachWrite skips WriteCloser.Close. SSH stdin Close can block on a
+	// dead mux; the read side already closed the native client.
+	detachWrite bool
 }
 
-func (p projectTransport) Close() error { _ = p.ReadCloser.Close(); return p.WriteCloser.Close() }
+func (p projectTransport) Close() error {
+	if p.ReadCloser != nil {
+		_ = p.ReadCloser.Close()
+	}
+	if p.detachWrite || p.WriteCloser == nil {
+		return nil
+	}
+	return p.WriteCloser.Close()
+}
 
 type projectShare struct {
 	cmd            *exec.Cmd
@@ -148,15 +162,40 @@ type projectShare struct {
 	approvalTimer  *time.Timer
 	windowsProject *windowsProjectBinding
 	stderr         *fileControlStderr
+	linuxManaged   bool
+	admit          bool
+	allowUnsaved   bool
+	epoch          uint64
+	state          string
+	errText        string
+	path           string
+	ctx            context.Context
+	ready          chan struct{}
+	firstDone      chan struct{}
+	readyOnce      sync.Once
+	firstOnce      sync.Once
+	cancel         context.CancelFunc
+	release        func()
+	releaseMu      sync.Mutex
 }
 
 func (p *projectShare) stop() {
 	p.once.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+		p.releaseMu.Lock()
+		release := p.release
+		transport := p.transport
+		p.releaseMu.Unlock()
+		if release != nil {
+			release()
+		}
 		if p.cmd != nil && p.cmd.Process != nil {
 			_ = p.cmd.Process.Kill()
 		}
-		if p.transport.ReadCloser != nil {
-			_ = p.transport.Close()
+		if transport.ReadCloser != nil {
+			_ = transport.Close()
 		}
 	})
 }
@@ -186,7 +225,7 @@ func startProjectTransport(cmd *exec.Cmd, path string) (*projectShare, error) {
 		_ = output.Close()
 		return nil, err
 	}
-	share := &projectShare{cmd: cmd, transport: projectTransport{output, input}, done: make(chan struct{})}
+	share := &projectShare{cmd: cmd, transport: projectTransport{ReadCloser: output, WriteCloser: input}, done: make(chan struct{})}
 	if err = cmd.Start(); err != nil {
 		_ = share.transport.Close()
 		return nil, err
@@ -228,74 +267,14 @@ func (s *Server) ensureProjectShare(path string) (returned error) {
 		return s.ensureMacOSProjectShare(path)
 	}
 	if path == s.environmentDir() {
-		return nil
+		return s.defaultEnvironmentShareReady()
 	}
-
-	s.mu.Lock()
-	current := s.projectShares[path]
-	s.mu.Unlock()
-	if current != nil {
-		select {
-		case <-current.done:
-			current.close()
-		default:
-			return nil
-		}
-	}
-	ctx, cancel := context.WithTimeout(s.operationContext(), 15*time.Second)
-	defer cancel()
-	quoted := shellescape.Quote(guestPath(path))
-	// Stale FUSE mounts can remain after a control-service restart. Only reconnect
-	// this explicitly authorized path, without changing other projects' mounts.
-	if _, err = s.guest(ctx, "if mountpoint -q "+quoted+"; then fusermount3 -uz "+quoted+"; fi; sudo mkdir -p "+quoted+" && sudo chown \"$(id -u):$(id -g)\" "+quoted); err != nil {
-		return errors.New("无法在 Cage 中准备项目目录")
-	}
-	probe, err := os.CreateTemp(path, ".cage-mount-probe-*")
-	if err != nil {
-		return fmt.Errorf("无法验证项目目录的读写权限：%w", err)
-	}
-	defer os.Remove(probe.Name())
-	challenge := randomToken()
-	if _, err = probe.WriteString(challenge); err != nil {
-		_ = probe.Close()
-		return err
-	}
-	if err = probe.Close(); err != nil {
-		return err
-	}
-	// Present shared files as owned by the guest user. Host UID/GID values differ
-	// across platforms and otherwise make Git reject an explicitly shared repo.
-	script := "exec sshfs " + shellescape.Quote(":"+filepath.ToSlash(path)) + " " + quoted + ` -o slave,allow_other,cache=no,nodev,nosuid,uid="$(id -u)",gid="$(id -g)"`
-	cmd := s.sshCommand(s.lifetimeContext(), "-T", s.sshTarget(), "--", script)
-	share, err := startProjectTransport(cmd, path)
-	if err != nil {
-		return err
-	}
-	for {
-		if _, err = s.guest(ctx, "mountpoint -q "+quoted+" && test \"$(cat "+shellescape.Quote(guestPath(probe.Name()))+")\" = "+shellescape.Quote(challenge)); err == nil {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			share.close()
-			return errors.New("项目文件夹连接超时，原有环境与会话保持运行")
-		case <-share.done:
-			share.close()
-			return errors.New("项目文件夹未能连接，原有环境与会话保持运行")
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	s.mu.Lock()
-	if s.projectShares == nil {
-		s.projectShares = map[string]*projectShare{}
-	}
-	s.projectShares[path] = share
-	s.mu.Unlock()
-	return nil
+	return s.ensureLinuxProjectShare(path)
 }
 
 type sharedProjects struct {
-	Paths []string `json:"paths"`
+	Paths []string            `json:"paths"`
+	Roots []projectRootRecord `json:"roots,omitempty"`
 }
 
 type projectShareError struct {
@@ -318,6 +297,10 @@ func projectShareFailure(path string, err error) projectShareError {
 func (s *Server) setProjectError(path string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.setProjectErrorLocked(path, err)
+}
+
+func (s *Server) setProjectErrorLocked(path string, err error) {
 	for i, failure := range s.projectErrors {
 		if failure.Path == path {
 			if err == nil {
@@ -380,24 +363,19 @@ func (s *Server) projectWorkspace(path string) (string, error) {
 }
 
 func (s *Server) rememberSharedProject(path string) error {
-	if path == s.environmentDir() {
+	if path == s.environmentDir() || isClientMountPath(path) {
 		return nil
 	}
-	var saved sharedProjects
-	if b, err := os.ReadFile(filepath.Join(s.profile, "projects.json")); err == nil {
-		if err = json.Unmarshal(b, &saved); err != nil {
-			return err
+	epoch := s.projectEpoch(path)
+	return s.updateProjectRecords(path, epoch, func(saved *sharedProjects) error {
+		for _, existing := range saved.Paths {
+			if existing == path {
+				return nil
+			}
 		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	for _, p := range saved.Paths {
-		if p == path {
-			return nil
-		}
-	}
-	saved.Paths = append(saved.Paths, path)
-	return writePrivate(filepath.Join(s.profile, "projects.json"), saved)
+		saved.Paths = append(saved.Paths, path)
+		return nil
+	})
 }
 func (s *Server) restoreProjectShares() {
 	var saved sharedProjects
@@ -436,7 +414,22 @@ func (s *Server) closeProjectShares() {
 	s.mu.Lock()
 	shares := s.projectShares
 	s.projectShares = nil
+	var cancels []context.CancelFunc
+	for path, share := range shares {
+		if s.projectShareEpoch == nil {
+			s.projectShareEpoch = map[string]uint64{}
+		}
+		s.projectShareEpoch[path]++
+		share.admit = false
+		share.state = projectShareStopped
+		if share.cancel != nil {
+			cancels = append(cancels, share.cancel)
+		}
+	}
 	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	for _, share := range shares {
 		share.stop()
 	}

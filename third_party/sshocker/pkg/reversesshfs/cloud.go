@@ -50,7 +50,8 @@ func (c *CloudShare) Serve(stream io.ReadWriteCloser) error {
 	c.mu.Unlock()
 
 	srv := sftp.NewRequestServer(stream, sftp.Handlers{FileGet: h, FilePut: h, FileCmd: h, FileList: h},
-		sftp.WithRSSequential(), sftp.WithRSMaxHandles(64), sftp.WithRSMaxTxPacket(64*1024))
+		sftp.WithRSSequential(), sftp.WithRSMaxHandles(64), sftp.WithRSMaxTxPacket(64*1024),
+		sftp.WithRSWriteTimeout(ConfinedWriteTimeout))
 	err := srv.Serve()
 	stream.Close()
 	c.mu.Lock()

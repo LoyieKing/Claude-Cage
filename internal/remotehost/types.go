@@ -6,6 +6,7 @@ package remotehost
 import (
 	"context"
 	"net/http"
+	"sync"
 )
 
 const APIProtocol = 1
@@ -60,9 +61,14 @@ func (m ServerManifest) Public() PublicManifest {
 
 // ConnectSecrets are never serialized or persisted. Connect copies the
 // passphrase before returning and clears that copy after SSH authentication.
+// Reconnect never stores the passphrase. AttachOnly refuses deploy, start and
+// setup; ExpectInstanceID refuses a different server before the session ticket
+// is exchanged.
 type ConnectSecrets struct {
-	Deploy     bool   `json:"-"`
-	Passphrase []byte `json:"-"`
+	Deploy           bool   `json:"-"`
+	AttachOnly       bool   `json:"-"`
+	ExpectInstanceID string `json:"-"`
+	Passphrase       []byte `json:"-"`
 }
 
 type ConnectionRef struct {
@@ -104,6 +110,30 @@ type Session struct {
 	Context   context.Context
 	Origin    string
 	close     func() error
+	reasonMu  sync.Mutex
+	reason    string
+}
+
+func (s *Session) mark(reason string) {
+	if s == nil || reason == "" {
+		return
+	}
+	s.reasonMu.Lock()
+	if s.reason == "" {
+		s.reason = reason
+	}
+	s.reasonMu.Unlock()
+}
+
+// Reason classifies why the session ended. Empty means the transport dropped.
+// remote_session_expired must not be followed by an automatic login.
+func (s *Session) Reason() string {
+	if s == nil {
+		return ""
+	}
+	s.reasonMu.Lock()
+	defer s.reasonMu.Unlock()
+	return s.reason
 }
 
 func (s *Session) Close() error {

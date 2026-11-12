@@ -85,13 +85,15 @@ func (p *uploadProgress) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func cloudEntry(ctx context.Context, client *ssh.Client, p HostProfile, deploy bool, phase func(string)) ([]byte, error) {
+func cloudEntry(ctx context.Context, client *ssh.Client, p HostProfile, deploy, attachOnly bool, phase func(string)) ([]byte, error) {
 	command, err := ServerEntryCommand(p)
 	if err != nil {
 		return nil, err
 	}
 	if out, err := runSSH(client, command, nil); err == nil {
 		return out, nil
+	} else if attachOnly {
+		return nil, failure("service_unavailable", "云端 Cage 未在运行。重新连接不会部署、升级或启动环境。")
 	}
 	phase("cloud_detect")
 	out, err := runSSH(client, lifecycleCommand(p, "probe"), nil)

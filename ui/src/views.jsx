@@ -17,6 +17,7 @@ import { api, writeClipboard, nativeAvailable } from "./api";
 import { runtimeSocketURL } from "./client-context.mjs";
 import { readClipboardContent, transferFiles, hasFiles, imagePayload, prepareClipboardPaste, sendImage } from "./image-transfer";
 import { terminalClipboardText } from "./terminal-clipboard.mjs";
+import { terminalGapNote, terminalInputID, terminalInputStatusNote } from "./terminal-recovery.mjs";
 import { sendFiles, shellFilePaths } from "./file-transfer";
 import { installRemoteInput } from "./remote-input";
 import { useWindowVisibility } from "./window-visibility";
@@ -294,7 +295,8 @@ export function TerminalView({ session, visible, focused = true, onStatus, onCon
     socket = useRef();
   const [connected, setConnected] = useState(false),
     [attempt, setAttempt] = useState(0),
-    [preparing, setPreparing] = useState(Boolean(session.cli_session_id && !session.closed));
+    [preparing, setPreparing] = useState(Boolean(session.cli_session_id && !session.closed)),
+    [gapNote, setGapNote] = useState("");
   const revealStartup = useRef();
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
@@ -406,6 +408,19 @@ export function TerminalView({ session, visible, focused = true, onStatus, onCon
           terminal.refresh(0, terminal.rows - 1);
         }
         if (state.type === "history") historyFrame = true;
+        if (state.type === "gap" || state.type === "lost") {
+          const note = terminalGapNote(state);
+          if (note) {
+            setGapNote(note);
+            terminal.write(`\r\n\x1b[33m[${note}]\x1b[0m\r\n`);
+          }
+          return;
+        }
+        if (state.type === "input-status") {
+          const note = terminalInputStatusNote(state.status);
+          if (note) setGapNote(note);
+          return;
+        }
         return;
       }
       if (historyFrame) {
@@ -417,7 +432,7 @@ export function TerminalView({ session, visible, focused = true, onStatus, onCon
     ws.onclose = () => { setConnected(false); reveal(); };
     const send = (data) => {
       if (disposed || ws.readyState !== WebSocket.OPEN) throw new Error("终端已断开，请重新连接后重试");
-      ws.send(JSON.stringify({ type: "input", data }));
+      ws.send(JSON.stringify({ type: "input", id: terminalInputID(), data }));
     };
     terminal.onData((data) => {
       if (emittingPaste) send(data);
@@ -600,6 +615,7 @@ export function TerminalView({ session, visible, focused = true, onStatus, onCon
   return (
     <div className={`terminal-view ${visible ? "" : "concealed"}`}>
       {session.workspace_notice && <p className="connection-banner" role="status">{session.workspace_notice}</p>}
+      {gapNote && <p className="connection-banner" role="status">{gapNote}</p>}
       {visible && session.cli_session_id && <SessionAccount id={session.cli_session_id} request={terminalAccountRequest} compact
         onChanged={onAccountChanged} />}
       <div className={`terminal-host ${preparing ? "terminal-preparing" : ""}`} ref={box} aria-hidden={preparing || undefined} />
